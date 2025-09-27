@@ -1,0 +1,193 @@
+// edu-complaint-app.js
+// To run: node edu-complaint-app.js
+// Make sure .env in same folder with MONGO_URI and JWT_SECRET defined
+
+require('dotenv').config();
+const path = require('path');
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const fs = require('fs');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const { MONGO_URI, JWT_SECRET } = process.env;
+
+if (!MONGO_URI || !JWT_SECRET) {
+  console.error('Please define MONGO_URI and JWT_SECRET in .env file');
+  process.exit(1);
+}
+
+app.use(cors());
+app.use(express.json());
+
+mongoose.connect(MONGO_URI).then(() => console.log('MongoDB connected')).catch(err => console.error(err));
+
+const UserSchema = new mongoose.Schema({
+  email: { type: String, unique: true, required: true, lowercase: true },
+  password: { type: String, required: true },
+  role: { type: String, enum: ['student', 'staff', 'admin'], required: true },
+  name: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const User = mongoose.model('User', UserSchema);
+
+const ComplaintSchema = new mongoose.Schema({
+  submittedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  category: { type: String, enum: ['maintenance', 'academics', 'harassment', 'other'], required: true },
+  priority: { type: String, enum: ['urgent', 'medium', 'low'], default: 'medium' },
+  description: { type: String, required: true },
+  status: { type: String, enum: ['submitted', 'in_progress', 'resolved'], default: 'submitted' },
+  feedback: String,
+  rating: { type: Number, min: 1, max: 5 },
+  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+const Complaint = mongoose.model('Complaint', ComplaintSchema);
+
+const auth = roles => {
+  if (typeof roles === 'string') roles = [roles];
+  return (req, res, next) => {
+    const token = req.header('Authorization')?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'No token' });
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      req.user = decoded;
+      if (roles.length && !roles.includes(req.user.role)) return res.status(403).json({ message: 'Forbidden' });
+      next();
+    } catch {
+      res.status(401).json({ message: 'Invalid token' });
+    }
+  };
+};
+
+app.post('/api/auth/register',
+  body('email').isEmail(),
+  body('password').isLength({ min: 6 }),
+  body('role').isIn(['student', 'staff', 'admin']),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { email, password, role, name } = req.body;
+      if (await User.findOne({ email })) return res.status(400).json({ message: 'User exists' });
+
+      const hashed = await bcrypt.hash(password, 10);
+      const user = new User({ email, password: hashed, role, name });
+      await user.save();
+
+      const token = jwt.sign({ id: user._id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+      res.status(201).json({ token, user: { id: user._id, email, role, name } });
+    } catch {
+      res.status(500).send('Server Error');
+    }
+  });
+
+app.post('/api/auth/login',
+  body('email').isEmail(),
+  body('password').exists(),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { email, password } = req.body;
+      const user = await User.findOne({ email });
+      if (!user) return res.status(400).json({ message: 'Invalid credentials' });
+
+      if (!(await bcrypt.compare(password, user.password))) return res.status(400).json({ message: 'Invalid credentials' });
+
+      const token = jwt.sign({ id: user._id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+      res.json({ token, user: { id: user._id, email, role: user.role, name: user.name } });
+    } catch {
+      res.status(500).send('Server Error');
+    }
+  });
+
+app.post('/api/complaints',
+  auth(['student', 'staff']),
+  body('category').isIn(['maintenance', 'academics', 'harassment', 'other']),
+  body('priority').isIn(['urgent', 'medium', 'low']),
+  body('description').isLength({ min: 5 }),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const complaint = new Complaint({ ...req.body, submittedBy: req.user.id });
+      await complaint.save();
+      res.status(201).json(complaint);
+    } catch {
+      res.status(500).send('Server Error');
+    }
+  });
+
+app.get('/api/complaints', auth(['student', 'staff', 'admin']), async (req, res) => {
+  try {
+    if (req.user.role === 'admin') {
+      const complaints = await Complaint.find()
+        .populate('submittedBy', 'email name')
+        .populate('assignedTo', 'email name')
+        .sort({ createdAt: -1 });
+      return res.json(complaints);
+    }
+    const complaints = await Complaint.find({ submittedBy: req.user.id }).sort({ createdAt: -1 });
+    res.json(complaints);
+  } catch {
+    res.status(500).send('Server Error');
+  }
+});
+
+app.put('/api/complaints/:id', auth(['staff', 'admin']), async (req, res) => {
+  const { status, assignedTo, feedback, rating } = req.body;
+
+  try {
+    const updates = { updatedAt: new Date() };
+    if (status) updates.status = status;
+    if (assignedTo) updates.assignedTo = assignedTo;
+    if (feedback) updates.feedback = feedback;
+    if (rating) updates.rating = rating;
+
+    const complaint = await Complaint.findByIdAndUpdate(req.params.id, updates, { new: true });
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found' });
+    res.json(complaint);
+  } catch {
+    res.status(500).send('Server Error');
+  }
+});
+
+app.get('/api/admin/stats', auth('admin'), async (req, res) => {
+  try {
+    const totalComplaints = await Complaint.countDocuments();
+    const statusCount = await Complaint.aggregate([{ $group: { _id: '$status', count: { $sum: 1 }}}]);
+    const categoryCount = await Complaint.aggregate([{ $group: { _id: '$category', count: { $sum: 1 }}}]);
+    const avgResolutionTime = await Complaint.aggregate([
+      { $match: { status: 'resolved' }},
+      { $project: { resolutionHours: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000*60*60] }}},
+      { $group: { _id: null, avg: { $avg: '$resolutionHours' } }}
+    ]);
+    res.json({
+      totalComplaints,
+      statusCount,
+      categoryCount,
+      avgResolutionHours: avgResolutionTime[0]?.avg || 0
+    });
+  } catch {
+    res.status(500).send('Server Error');
+  }
+});
+
+// Serve React static build
+const buildPath = path.join(__dirname, 'frontend', 'build');
+app.use(express.static(buildPath));
+app.get('*', (req,res) => {
+  res.sendFile(path.join(buildPath,'index.html'));
+});
+
+// Start server
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
